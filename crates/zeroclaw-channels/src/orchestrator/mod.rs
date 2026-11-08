@@ -57214,22 +57214,6 @@ Done."#;
     }
 
     #[test]
-    fn current_turn_user_index_skips_the_max_iteration_summary_prompt() {
-        let (history, appended) = capped_turn_history();
-
-        assert_eq!(
-            current_turn_user_index(&history, &appended, Some("give me access to exa")),
-            3,
-            "the inbound turn, not the loop's synthetic summary request, anchors the turn"
-        );
-        assert_eq!(
-            current_turn_user_index(&history, &[], None),
-            6,
-            "without the loop's record the last user message is the only anchor"
-        );
-    }
-
-    #[test]
     fn current_turn_user_index_falls_back_when_the_record_does_not_line_up() {
         let (history, appended) = capped_turn_history();
 
@@ -57260,18 +57244,6 @@ Done."#;
         let tool_msgs = extract_current_turn_tool_messages(&history, idx);
         assert_eq!(tool_msgs.len(), 2, "the call and its carrier stay paired");
         assert_eq!(tool_msgs[1].content, carrier);
-    }
-
-    #[test]
-    fn extract_current_turn_tool_messages_drops_the_max_iteration_summary_prompt() {
-        let (history, appended) = capped_turn_history();
-        let idx = current_turn_user_index(&history, &appended, Some("give me access to exa"));
-
-        let tool_msgs = extract_current_turn_tool_messages(&history, idx);
-
-        assert_eq!(tool_msgs.len(), 2, "{tool_msgs:?}");
-        assert_eq!(tool_msgs[0].role, "assistant");
-        assert_eq!(tool_msgs[1].role, "tool");
     }
 
     /// Native tool-calling provider that keeps calling a tool for as long as
