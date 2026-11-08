@@ -7,14 +7,16 @@ name: Patched Release (fork)
 # layout and features as the official ones, for the two Linux targets that
 # `zeroclaw update` knows.
 #
-# Trigger: push a tag named `patched-*` (e.g. `patched-v0.8.7-fix12187.1`).
-# Upstream's tag-triggered workflows listen to `v*`, so a `patched-` tag never
-# starts a Docker publish or a stable release here.
+# Trigger: a push to a patched release branch (`v<version>-fix-<issue>`, e.g.
+# `v0.8.7-fix-12187`). The publish job tags the pushed commit as
+# `patched-v<version>-<short sha>` and creates the release; re-running it for
+# the same commit re-uploads the assets. Upstream's tag-triggered workflows
+# listen to `v*` tags, so a `patched-` tag starts nothing else here.
 
 on:
   push:
-    tags:
-      - "patched-*"
+    branches:
+      - "v*-fix-*"
 
 permissions:
   contents: read
@@ -25,8 +27,9 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Upstream commit this branch is based on (the v0.8.7 tag). The fork has no
-  # upstream tags, so the release notes list the commits on top of it by SHA.
+  # Upstream commit the patched branch is based on (the v0.8.7 tag). The fork
+  # has no upstream tags, so the release notes list the commits on top of it
+  # by SHA. Update it when a branch is based on another release.
   UPSTREAM_BASE: 99bd353c756f4e64f381cfe9c3002ebff32f3055
 
 jobs:
@@ -167,10 +170,15 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          tag="patched-v${version}-${GITHUB_SHA::7}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release ${tag} exists; re-uploading its assets."
+            gh release upload "$tag" release-assets/* --repo "$GITHUB_REPOSITORY" --clobber
+            exit 0
+          fi
           {
             echo "Patched build of ZeroClaw ${version} from \`${GITHUB_SHA::12}\`."
             echo
@@ -183,8 +191,8 @@ jobs:
             echo "\`zeroclaw update\` only reads upstream releases; install these archives by hand and check them against \`SHA256SUMS\`."
           } > release-notes.md
           cat release-notes.md
-          gh release create "$TAG" release-assets/* \
+          gh release create "$tag" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
-            --verify-tag \
-            --title "ZeroClaw ${version} + fix for #12187 (${TAG})" \
+            --target "$GITHUB_SHA" \
+            --title "ZeroClaw ${version} patched (${GITHUB_SHA::7})" \
             --notes-file release-notes.md
