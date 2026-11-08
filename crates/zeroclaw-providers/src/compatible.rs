@@ -2627,20 +2627,6 @@ fn is_valid_mistral_tool_call_id(id: &str) -> bool {
     id.len() == 9 && id.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
-/// Read the `tool_call_id` out of the leading JSON envelope of a tool-result
-/// content string, tolerating trailing bytes.
-///
-/// Some replay paths concatenate a follow-up turn onto the result text, which
-/// leaves the envelope itself intact but makes the whole string invalid JSON.
-/// Parsing just the first value recovers the id the result belongs to, so the
-/// request keeps a `role=tool` message that carries its `tool_call_id` (strict
-/// providers reject the entire request otherwise).
-fn recover_leading_tool_call_id(content: &str) -> Option<String> {
-    let mut values = serde_json::Deserializer::from_str(content).into_iter::<serde_json::Value>();
-    let value = values.next()?.ok()?;
-    value.get("tool_call_id")?.as_str().map(ToString::to_string)
-}
-
 fn reserve_tool_call_id_for_contract(
     targets_mistral_tool_call_contract: bool,
     raw_id: Option<String>,
@@ -3603,8 +3589,13 @@ impl OpenAiCompatibleModelProvider {
                     };
                 }
 
+                // Only the leading JSON value: a replay path may have appended a
+                // follow-up turn after the envelope, and the result still needs
+                // its `tool_call_id` (strict providers reject the request without).
                 if message.role == "tool"
-                    && let Ok(value) = serde_json::from_str::<serde_json::Value>(&message.content)
+                    && let Some(Ok(value)) = serde_json::Deserializer::from_str(&message.content)
+                        .into_iter::<serde_json::Value>()
+                        .next()
                 {
                     let mut tool_call_id = value
                         .get("tool_call_id")
@@ -3676,44 +3667,11 @@ impl OpenAiCompatibleModelProvider {
                         name: tool_name,
                     };
                 }
-                // A tool turn whose envelope did not parse (for example a replay
-                // path appended a follow-up turn to the result text) must still
-                // carry the id its result belongs to: strict providers reject the
-                // request when `role=tool` arrives without `tool_call_id`. Read
-                // the id out of the leading JSON envelope, ignoring trailing
-                // bytes, and fall back to the most recent assistant tool call.
-                let recovered_tool_call_id = (message.role == "tool").then(|| {
-                    let recovered = recover_leading_tool_call_id(&message.content)
-                        .map(|raw_id| {
-                            // Resolve through the same map the whole-envelope
-                            // branch uses: a contract that rewrites ids (Mistral
-                            // uses nine alphanumeric characters) must see the call
-                            // and its result carry the same id, or the request is
-                            // rejected just like the missing-field case.
-                            tool_call_id_map.get(raw_id.as_str()).cloned().unwrap_or_else(|| {
-                                let normalized = reserve_tool_call_id_for_contract(
-                                    targets_mistral_tool_call_contract,
-                                    Some(raw_id.clone()),
-                                    &mut used_tool_call_ids,
-                                );
-                                tool_call_id_map.insert(raw_id, normalized.clone());
-                                normalized
-                            })
-                        })
-                        .or_else(|| last_assistant_tool_call_ids.first().cloned());
-                    if recovered.is_none() {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({
-                                    "content_chars": message.content.chars().count(),
-                                })),
-                            "tool-result message serialized without tool_call_id: neither the leading envelope nor the preceding assistant turn supplied an id"
-                        );
-                    }
-                    recovered
-                }).flatten();
+                // A plain-text tool result answers the most recent tool call.
+                let tool_call_id = last_assistant_tool_call_ids
+                    .first()
+                    .filter(|_| message.role == "tool")
+                    .cloned();
                 NativeMessage {
                     role: message.role.clone(),
                     content: Some(self.message_content_for_role(
@@ -3721,7 +3679,7 @@ impl OpenAiCompatibleModelProvider {
                         &message.content,
                         allow_user_image_parts,
                     )),
-                    tool_call_id: recovered_tool_call_id,
+                    tool_call_id,
                     tool_calls: None,
                     reasoning_content: None,
                     reasoning: None,
@@ -5275,25 +5233,6 @@ mod tests {
     fn sanitize_tool_arguments_empty_or_whitespace_becomes_empty_object() {
         assert_eq!(sanitize_tool_arguments("f", ""), "{}");
         assert_eq!(sanitize_tool_arguments("f", "   \n\t  "), "{}");
-    }
-
-    /// A tool-result envelope that some replay path extended with trailing
-    /// prose is still readable: take the leading JSON value and keep the id so
-    /// `role=tool` never reaches the wire without `tool_call_id`.
-    #[test]
-    fn recover_leading_tool_call_id_tolerates_trailing_turn() {
-        assert_eq!(
-            recover_leading_tool_call_id(
-                "{\"content\":\"out\",\"tool_call_id\":\"call_1\"}\n\ngrade the host"
-            ),
-            Some("call_1".to_string())
-        );
-        assert_eq!(recover_leading_tool_call_id("plain tool output"), None);
-        assert_eq!(
-            recover_leading_tool_call_id("{\"content\":\"out\"}"),
-            None,
-            "an envelope without an id yields nothing"
-        );
     }
 
     /// The `/models` success path buffers the whole body before parsing, so a
