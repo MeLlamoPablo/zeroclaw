@@ -4530,20 +4530,25 @@ fn resync_sender_history_after_trim(
 /// entry for `sender_key`, so a caller that appended anyway would just
 /// recreate an unreconciled entry from its own working buffer instead of
 /// letting the next turn reload from the backend.
+///
+/// `current_turn_idx` is the position of this turn's inbound user message in
+/// `history` (see [`current_turn_user_index`]); everything up to and
+/// including it is the retained base, everything after it is this turn's own
+/// output, which the caller appends separately.
 #[allow(clippy::too_many_arguments)]
 fn resync_history_after_trim_or_evict_cache(
     ctx: &ChannelRuntimeContext,
     sender_key: &str,
     history: &[ChatMessage],
+    current_turn_idx: usize,
     history_has_trim_breadcrumb: bool,
     crumb_present_before_loop: bool,
     prior_turns_len_before_loop: usize,
     known_prefix: &[ChatMessage],
     outgoing_user_turn_raw_content: Option<&str>,
 ) -> bool {
-    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
-    let retained_prior_turns = if last_user_idx >= 1 {
-        &history[1..=last_user_idx]
+    let retained_prior_turns = if current_turn_idx >= 1 {
+        &history[1..=current_turn_idx]
     } else {
         &history[1..1]
     };
@@ -4618,16 +4623,77 @@ fn resync_history_after_trim_or_evict_cache(
     !reconciled
 }
 
+/// Position in the tool loop's `history` of the inbound user message this
+/// channel turn answers.
+///
+/// The last user-role message is not necessarily the sender's: the tool loop
+/// appends user-role messages of its own after it — the max-iteration
+/// summary prompt ("Agent exceeded maximum tool iterations ..."),
+/// prompt-mode tool-result carriers, SOP step context. Anchoring on such a
+/// message makes the post-loop resync treat this turn's tool rows as retained
+/// prior turns and overwrite the loop's message with the sender's raw text,
+/// so the durable transcript gains a duplicate of the request right after a
+/// tool result (#12187).
+///
+/// `loop_appended` is the loop's own record of what it appended
+/// (`new_messages_out`), so the sender's message is the user message just
+/// before the user-role messages listed there. Trims only drop older turns
+/// from the front, which leaves that count intact. When the record does not
+/// line up with `history` (no such message, or it does not end with
+/// `raw_current_turn_content`), this falls back to the last user message.
+fn current_turn_user_index(
+    history: &[ChatMessage],
+    loop_appended: &[ChatMessage],
+    raw_current_turn_content: Option<&str>,
+) -> usize {
+    let last_user_idx = || history.iter().rposition(|m| m.role == "user").unwrap_or(0);
+    let loop_user_turns = loop_appended.iter().filter(|m| m.role == "user").count();
+    if loop_user_turns == 0 {
+        return last_user_idx();
+    }
+    let anchored = history
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, m)| m.role == "user")
+        .nth(loop_user_turns)
+        .map(|(idx, _)| idx)
+        .filter(|&idx| {
+            // The loop may prepend context (recalled memory) to the sender's
+            // message, never append to it.
+            raw_current_turn_content.is_none_or(|raw| history[idx].content.ends_with(raw))
+        });
+    anchored.unwrap_or_else(|| {
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "loop_user_turns": loop_user_turns,
+                    "history_len": history.len(),
+                })),
+            "could not locate the inbound user turn behind the tool loop's own user-role \
+             messages; anchoring on the last user message"
+        );
+        last_user_idx()
+    })
+}
+
 /// Extract tool-call (assistant with tool_call content) and tool-result
 /// messages from the current turn in the LLM history, excluding the final
-/// assistant text response.  "Current turn" = everything after the last
-/// user-role message.
-fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessage> {
-    // Find the index of the last user message — tool messages for the
-    // current turn come after it.
-    let last_user_idx = history.iter().rposition(|m| m.role == "user").unwrap_or(0);
-
-    let tail = &history[last_user_idx + 1..];
+/// assistant text response. "Current turn" = everything after
+/// `current_turn_idx`, the inbound user message (see
+/// [`current_turn_user_index`]). User-role messages the loop added there are
+/// kept only when they are prompt-mode tool-result carriers; synthetic
+/// prompts such as the max-iteration summary request are not part of the
+/// conversation and are not persisted.
+fn extract_current_turn_tool_messages(
+    history: &[ChatMessage],
+    current_turn_idx: usize,
+) -> Vec<ChatMessage> {
+    let Some(tail) = history.get(current_turn_idx + 1..) else {
+        return Vec::new();
+    };
     if tail.is_empty() {
         return Vec::new();
     }
@@ -4642,7 +4708,10 @@ fn extract_current_turn_tool_messages(history: &[ChatMessage]) -> Vec<ChatMessag
 
     tail[..end]
         .iter()
-        .filter(|m| m.role == "assistant" || m.role == "tool")
+        .filter(|m| {
+            m.role == "assistant"
+                || zeroclaw_api::tool_carrier::is_tool_result_carrier(&m.role, &m.content)
+        })
         .cloned()
         .collect()
 }
@@ -10430,6 +10499,11 @@ async fn process_channel_message_body(
         ctx.prompt_config
             .effective_max_execution_tree_iterations(&ctx.agent_alias),
     );
+    // Every message the tool loop appends to `history` across model-switch
+    // retries, in order. The post-loop resync and tool-row persistence use
+    // it to find this turn's inbound user message behind the loop's own
+    // user-role messages (see `current_turn_user_index`).
+    let mut loop_appended_messages: Vec<ChatMessage> = Vec::new();
     let scoped_turn = scope_provider_fallback(Box::pin(async {
         let llm_result = loop {
             let thread_scope_id = msg
@@ -10444,6 +10518,9 @@ async fn process_channel_message_body(
                     ctx.non_cli_excluded_tools.as_ref()
                 };
             loop_knobs.provider_attempt_allowlist = attempt_allowlist.clone();
+            // A fresh buffer per attempt: the loop replays whatever its
+            // buffer already holds into `history` when it starts.
+            let mut attempt_appended_messages: Vec<ChatMessage> = Vec::new();
             let tool_loop = Box::pin(run_tool_call_loop(ToolLoop {
                 exec: ResolvedAgentExecution::resolve(
                     ResolvedModelAccess {
@@ -10503,7 +10580,7 @@ async fn process_channel_message_body(
                     .map(|_| tool_receipts_collector.as_ref()),
                 event_tx: None,
                 steering: None,
-                new_messages_out: None,
+                new_messages_out: Some(&mut attempt_appended_messages),
                 image_cache: None,
                 memory: Some(zeroclaw_runtime::agent::memory_inject::TurnMemory {
                     handle: ctx.memory.as_ref(),
@@ -10566,6 +10643,7 @@ async fn process_channel_message_body(
                 () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
                 result = timed_tool_loop => LlmExecutionResult::Completed(result),
             };
+            loop_appended_messages.append(&mut attempt_appended_messages);
 
             if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
                 && let Some((new_model_provider, new_model)) = is_model_switch_requested(e)
@@ -10709,10 +10787,16 @@ async fn process_channel_message_body(
     // Attribute the closing event to the final route and attach aggregate
     // usage. Explicit completion records the normal duration; the guard's
     // `Drop` path supplies the same matched end on panic or early unwind.
+    let current_turn_idx = current_turn_user_index(
+        &history,
+        &loop_appended_messages,
+        outgoing_user_turn_raw_content.as_deref(),
+    );
     let history_resync_failed = resync_history_after_trim_or_evict_cache(
         ctx.as_ref(),
         &history_key,
         &history,
+        current_turn_idx,
         history_has_trim_breadcrumb,
         crumb_present_before_loop,
         prior_turns_len_before_loop,
@@ -10933,9 +11017,10 @@ async fn process_channel_message_body(
             let keep_tool_turns = ctx.agent_cfg.resolved.keep_tool_context_turns;
             if !history_resync_failed && keep_tool_turns > 0 {
                 // Find tool messages for the current turn: everything after
-                // the last user message up to (but not including) the final
+                // the inbound user message up to (but not including) the final
                 // assistant response that matches our delivered text.
-                let tool_messages: Vec<ChatMessage> = extract_current_turn_tool_messages(&history);
+                let tool_messages: Vec<ChatMessage> =
+                    extract_current_turn_tool_messages(&history, current_turn_idx);
                 for tool_msg in tool_messages {
                     append_sender_turn(ctx.as_ref(), &history_key, tool_msg);
                 }
@@ -19157,6 +19242,7 @@ fn caller_evicts_cache_and_does_not_guess_flag_when_trim_resync_fails() {
         ctx.as_ref(),
         &sender,
         &loop_history,
+        current_turn_user_index(&loop_history, &[], None),
         true,  // history_has_trim_breadcrumb
         false, // crumb_present_before_loop
         1,     // prior_turns_len_before_loop
@@ -19353,6 +19439,7 @@ fn stale_no_trim_completion_does_not_overwrite_a_newer_trims_flag() {
         ctx.as_ref(),
         &sender,
         &loop_history,
+        current_turn_user_index(&loop_history, &[], None),
         false, // history_has_trim_breadcrumb
         false, // crumb_present_before_loop (worker A's stale snapshot)
         prior_len_a,
@@ -56651,7 +56738,10 @@ Done."#;
             ChatMessage::assistant("Done, iPad is blocked."),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&history);
+        let tool_msgs = extract_current_turn_tool_messages(
+            &history,
+            current_turn_user_index(&history, &[], None),
+        );
         assert_eq!(tool_msgs.len(), 2);
         assert_eq!(tool_msgs[0].role, "assistant");
         assert!(tool_msgs[0].content.contains("tool_call"));
@@ -56665,7 +56755,10 @@ Done."#;
             ChatMessage::assistant("Hi there!"),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&history);
+        let tool_msgs = extract_current_turn_tool_messages(
+            &history,
+            current_turn_user_index(&history, &[], None),
+        );
         assert!(tool_msgs.is_empty());
     }
 
@@ -56680,8 +56773,286 @@ Done."#;
             ChatMessage::assistant("All done."),
         ];
 
-        let tool_msgs = extract_current_turn_tool_messages(&history);
+        let tool_msgs = extract_current_turn_tool_messages(
+            &history,
+            current_turn_user_index(&history, &[], None),
+        );
         assert_eq!(tool_msgs.len(), 4);
+    }
+
+    const CAP_SUMMARY_PROMPT: &str = "Agent exceeded maximum tool iterations (2). Please \
+        provide your best answer based on the work completed so far. Summarize what you \
+        accomplished and what remains to be done.";
+
+    /// The history the tool loop leaves behind when a turn reaches the
+    /// iteration cap, plus the loop's own record of what it appended.
+    fn capped_turn_history() -> (Vec<ChatMessage>, Vec<ChatMessage>) {
+        let prior = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("older msg"),
+            ChatMessage::assistant("older reply"),
+            ChatMessage::user("[turn-context] message_id=7\n\ngive me access to exa"),
+        ];
+        let appended = vec![
+            ChatMessage::assistant(
+                r#"{"content":null,"tool_calls":[{"id":"call_1","name":"shell","arguments":"{}"}]}"#,
+            ),
+            ChatMessage::tool(r#"{"content":"out","tool_call_id":"call_1","attachments":[]}"#),
+            ChatMessage::user(CAP_SUMMARY_PROMPT),
+            ChatMessage::assistant("I could not finish; the API key is still missing."),
+        ];
+        let mut history = prior;
+        history.extend(appended.iter().cloned());
+        (history, appended)
+    }
+
+    #[test]
+    fn current_turn_user_index_skips_the_max_iteration_summary_prompt() {
+        let (history, appended) = capped_turn_history();
+
+        assert_eq!(
+            current_turn_user_index(&history, &appended, Some("give me access to exa")),
+            3,
+            "the inbound turn, not the loop's synthetic summary request, anchors the turn"
+        );
+        assert_eq!(
+            current_turn_user_index(&history, &[], None),
+            6,
+            "without the loop's record the last user message is the only anchor"
+        );
+    }
+
+    #[test]
+    fn current_turn_user_index_falls_back_when_the_record_does_not_line_up() {
+        let (history, appended) = capped_turn_history();
+
+        // The anchored message does not carry this turn's raw text.
+        assert_eq!(
+            current_turn_user_index(&history, &appended, Some("something else")),
+            6
+        );
+        // More loop-added user messages than `history` holds.
+        let too_many = vec![ChatMessage::user("a"); 4];
+        assert_eq!(current_turn_user_index(&history, &too_many, None), 6);
+    }
+
+    #[test]
+    fn current_turn_user_index_skips_prompt_mode_tool_carriers() {
+        let carrier = "[Tool results]\n<tool_result name=\"shell\">out</tool_result>";
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("run it"),
+            ChatMessage::assistant("<tool_call>{\"name\":\"shell\"}</tool_call>"),
+            ChatMessage::user(carrier),
+            ChatMessage::assistant("done"),
+        ];
+        let appended = history[2..].to_vec();
+
+        let idx = current_turn_user_index(&history, &appended, Some("run it"));
+        assert_eq!(idx, 1);
+        let tool_msgs = extract_current_turn_tool_messages(&history, idx);
+        assert_eq!(tool_msgs.len(), 2, "the call and its carrier stay paired");
+        assert_eq!(tool_msgs[1].content, carrier);
+    }
+
+    #[test]
+    fn extract_current_turn_tool_messages_drops_the_max_iteration_summary_prompt() {
+        let (history, appended) = capped_turn_history();
+        let idx = current_turn_user_index(&history, &appended, Some("give me access to exa"));
+
+        let tool_msgs = extract_current_turn_tool_messages(&history, idx);
+
+        assert_eq!(tool_msgs.len(), 2, "{tool_msgs:?}");
+        assert_eq!(tool_msgs[0].role, "assistant");
+        assert_eq!(tool_msgs[1].role, "tool");
+    }
+
+    /// Native tool-calling provider that keeps calling a tool for as long as
+    /// it is offered tools on the turn that asks for `CAP_HIT_REQUEST`, so the
+    /// turn ends at the iteration cap with a tools-free summary. Records every
+    /// request it receives.
+    struct CapHittingToolProvider {
+        requests: std::sync::Mutex<Vec<Vec<ChatMessage>>>,
+        calls: AtomicUsize,
+    }
+
+    const CAP_HIT_REQUEST: &str = "give me access to exa";
+
+    #[async_trait::async_trait]
+    impl ModelProvider for CapHittingToolProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        async fn chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<String> {
+            Ok("ok".to_string())
+        }
+
+        fn capabilities(&self) -> zeroclaw_api::model_provider::ProviderCapabilities {
+            zeroclaw_api::model_provider::ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+                prompt_caching: false,
+                extended_thinking: false,
+            }
+        }
+
+        async fn chat(
+            &self,
+            request: zeroclaw_providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: Option<f64>,
+        ) -> anyhow::Result<zeroclaw_providers::ChatResponse> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(request.messages.to_vec());
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            let keeps_calling_tools = request.tools.is_some_and(|tools| !tools.is_empty())
+                && request
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| m.role == "user")
+                    .is_some_and(|m| m.content.ends_with(CAP_HIT_REQUEST));
+            if keeps_calling_tools {
+                return Ok(zeroclaw_providers::ChatResponse {
+                    text: None,
+                    tool_calls: vec![zeroclaw_providers::ToolCall {
+                        id: format!("call-{n}"),
+                        name: "mock_price".to_string(),
+                        arguments: format!(r#"{{"symbol":"BTC","attempt":{n}}}"#),
+                        extra_content: None,
+                    }],
+                    usage: None,
+                    reasoning_content: None,
+                });
+            }
+            Ok(zeroclaw_providers::ChatResponse {
+                text: Some(format!("plain answer {n}")),
+                tool_calls: Vec::new(),
+                usage: None,
+                reasoning_content: None,
+            })
+        }
+    }
+
+    impl ::zeroclaw_api::attribution::Attributable for CapHittingToolProvider {
+        fn role(&self) -> ::zeroclaw_api::attribution::Role {
+            ::zeroclaw_api::attribution::Role::Provider(
+                ::zeroclaw_api::attribution::ProviderKind::Model(
+                    ::zeroclaw_api::attribution::ModelProviderKind::Custom,
+                ),
+            )
+        }
+        fn alias(&self) -> &str {
+            "CapHittingToolProvider"
+        }
+    }
+
+    /// #12187: a turn that reaches `max_tool_iterations` must leave a
+    /// transcript the next request can be built from. The loop's synthetic
+    /// summary request used to anchor the post-turn resync, which rewrote it
+    /// into a second copy of the sender's request right after the last tool
+    /// result; the next turn's normalizer then merged that copy into the tool
+    /// envelope, and the provider rejected every later request in the chat.
+    #[tokio::test]
+    async fn turn_after_tool_iteration_cap_sends_a_well_formed_history() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let provider_impl = Arc::new(CapHittingToolProvider {
+            requests: std::sync::Mutex::new(Vec::new()),
+            calls: AtomicUsize::new(0),
+        });
+        let mut runtime_ctx = test_runtime_ctx_with_observer_and_tools(
+            channel,
+            provider_impl.clone(),
+            zeroclaw_config::schema::Config::default(),
+            zeroclaw_config::schema::AliasedAgentConfig::default(),
+            "test-provider",
+            None,
+            Arc::new(NoopObserver),
+            vec![Box::new(MockPriceTool)],
+        );
+        {
+            let ctx = Arc::get_mut(&mut runtime_ctx).expect("a fresh context is uniquely owned");
+            ctx.max_tool_iterations = 2;
+            ctx.pacing.loop_detection_enabled = false;
+        }
+
+        let mut capped = message_sent_hook_test_message();
+        capped.id = "msg-cap".to_string();
+        capped.content = CAP_HIT_REQUEST.to_string();
+        process_channel_message(Arc::clone(&runtime_ctx), capped, CancellationToken::new()).await;
+
+        let mut follow_up = message_sent_hook_test_message();
+        follow_up.id = "msg-follow-up".to_string();
+        follow_up.timestamp = 2;
+        follow_up.content = "Hola?".to_string();
+        process_channel_message(runtime_ctx, follow_up, CancellationToken::new()).await;
+
+        let requests = provider_impl
+            .requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        assert!(
+            requests.iter().any(|messages| messages.iter().any(|m| m
+                .content
+                .starts_with("Agent exceeded maximum tool iterations"))),
+            "the first turn must reach the cap and ask for a summary: {requests:#?}"
+        );
+        let next = requests.last().expect("the follow-up reached the provider");
+        assert!(
+            next.last().is_some_and(|m| m.content.ends_with("Hola?")),
+            "the last request must be the follow-up turn: {next:#?}"
+        );
+
+        for (idx, message) in next.iter().enumerate() {
+            if message.role == "tool" {
+                let envelope: serde_json::Value = serde_json::from_str(&message.content)
+                    .unwrap_or_else(|e| {
+                        panic!("tool message {idx} is not a valid envelope ({e}): {next:#?}")
+                    });
+                assert!(
+                    envelope["tool_call_id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty()),
+                    "tool message {idx} lost its tool_call_id: {next:#?}"
+                );
+            }
+        }
+        for pair in next.windows(2) {
+            assert!(
+                !(pair[0].role == "tool" && pair[1].role == "user"),
+                "no user turn may sit right after a tool result: {next:#?}"
+            );
+        }
+        let request_copies = next
+            .iter()
+            .filter(|m| m.role == "user" && m.content.ends_with(CAP_HIT_REQUEST))
+            .count();
+        assert_eq!(
+            request_copies, 1,
+            "the capped request must be stored once: {next:#?}"
+        );
+        assert!(
+            !next.iter().any(|m| m
+                .content
+                .starts_with("Agent exceeded maximum tool iterations")),
+            "the loop's synthetic summary request is not part of the conversation: {next:#?}"
+        );
     }
 
     #[test]
